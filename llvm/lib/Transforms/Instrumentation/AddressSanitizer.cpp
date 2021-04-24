@@ -1300,20 +1300,32 @@ Value *AddressSanitizer::memToShadow(Value *Shadow, IRBuilder<> &IRB) {
 // Instrument memset/memmove/memcpy
 void AddressSanitizer::instrumentMemIntrinsic(MemIntrinsic *MI) {
   IRBuilder<> IRB(MI);
+
+  // TODO: For Kasper, we should either: (a) add a hook into e.g., the C
+  // definition of dfs$memset, which calls the kdfsan handler, or (b) add hooks
+  // from the KDFSAN pass which look for memsets with 'is-asan-instr', which
+  // call the kdfsan handler
+  Instruction *NewI = nullptr;
+
   if (isa<MemTransferInst>(MI)) {
-    IRB.CreateCall(
+    NewI = IRB.CreateCall(
         isa<MemMoveInst>(MI) ? AsanMemmove : AsanMemcpy,
         {IRB.CreatePointerCast(MI->getOperand(0), IRB.getInt8PtrTy()),
          IRB.CreatePointerCast(MI->getOperand(1), IRB.getInt8PtrTy()),
          IRB.CreateIntCast(MI->getOperand(2), IntptrTy, false)});
   } else if (isa<MemSetInst>(MI)) {
-    IRB.CreateCall(
+    NewI = IRB.CreateCall(
         AsanMemset,
         {IRB.CreatePointerCast(MI->getOperand(0), IRB.getInt8PtrTy()),
          IRB.CreateIntCast(MI->getOperand(1), IRB.getInt32Ty(), false),
          IRB.CreateIntCast(MI->getOperand(2), IntptrTy, false)});
   }
   MI->eraseFromParent();
+
+  // The original memintrinsic is replaced with a call, so we'll add metadata to
+  // the new call instruction
+  NewI->setMetadata(NewI->getModule()->getMDKindID("is-asan-instr"),
+      MDNode::get(*C, None));
 }
 
 /// Check if we want (and can) handle this alloca.
@@ -1579,6 +1591,10 @@ void AddressSanitizer::instrumentMop(ObjectSizeOffsetVisitor &ObjSizeVis,
     NumInstrumentedWrites++;
   else
     NumInstrumentedReads++;
+
+  O.getInsn()->setMetadata(
+      O.getInsn()->getModule()->getMDKindID("is-asan-instr"),
+      MDNode::get(*C, None));
 
   unsigned Granularity = 1 << Mapping.Scale;
   if (O.MaybeMask) {
