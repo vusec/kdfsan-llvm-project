@@ -189,6 +189,14 @@ static cl::opt<bool> ClEventCallbacks(
     cl::desc("Insert calls to __dfsan_*_callback functions on data events."),
     cl::Hidden, cl::init(false));
 
+// Inserts calls to:
+//    void __dfsan_kasper_branch_check(dfsan_label label)
+static cl::opt<bool> ClKasperBranchChecks(
+    "dfsan-kasper-branch-checks",
+    cl::desc("Insert calls to __dfsan_kasper_branch_check on br, switch, "
+             "indirectbr, indirect call, and indirect invoke instructions."),
+    cl::Hidden, cl::init(false));
+
 static StringRef GetGlobalTypeString(const GlobalValue &G) {
   // Types of GlobalVariables are always pointer types.
   Type *GType = G.getValueType();
@@ -374,6 +382,7 @@ class DataFlowSanitizer : public ModulePass {
   FunctionType *DFSanLoadStoreCallbackFnTy;
   FunctionType *DFSanMemTransferCallbackFnTy;
   FunctionType *DFSanCmpCallbackFnTy;
+  FunctionType *DFSanKasperBranchCheckFnTy;
   FunctionCallee DFSanUnionFn;
   FunctionCallee DFSanCheckedUnionFn;
   FunctionCallee DFSanUnionLoadFn;
@@ -386,6 +395,7 @@ class DataFlowSanitizer : public ModulePass {
   FunctionCallee DFSanStoreCallbackFn;
   FunctionCallee DFSanMemTransferCallbackFn;
   FunctionCallee DFSanCmpCallbackFn;
+  FunctionCallee DFSanKasperBranchCheckFn;
   MDNode *ColdCallWeights;
   DFSanABIList ABIList;
   DenseMap<Value *, Function *> UnwrappedFnMap;
@@ -406,6 +416,7 @@ class DataFlowSanitizer : public ModulePass {
                                  GlobalValue::LinkageTypes NewFLink,
                                  FunctionType *NewFT);
   Constant *getOrBuildTrampolineFunction(FunctionType *FT, StringRef FName);
+  void initializeKasperFunctions(Module &M);
   void initializeCallbackFunctions(Module &M);
   void initializeRuntimeFunctions(Module &M);
 
@@ -498,6 +509,9 @@ public:
   void visitSelectInst(SelectInst &I);
   void visitMemSetInst(MemSetInst &I);
   void visitMemTransferInst(MemTransferInst &I);
+  void visitBranchInst(BranchInst &I);
+  void visitSwitchInst(SwitchInst &I);
+  void visitIndirectBrInst(IndirectBrInst &I);
 };
 
 } // end anonymous namespace
@@ -645,6 +659,8 @@ bool DataFlowSanitizer::doInitialization(Module &M) {
       DFSanMemTransferArgs, /*isVarArg=*/false);
   DFSanCmpCallbackFnTy =
       FunctionType::get(Type::getVoidTy(*Ctx), ShadowTy, /*isVarArg=*/false);
+  DFSanKasperBranchCheckFnTy =
+      FunctionType::get(Type::getVoidTy(*Ctx), ShadowTy, /*isVarArg=*/ false);
 
   if (GetArgTLSPtr) {
     Type *ArgTLSTy = ArrayType::get(ShadowTy, 64);
@@ -839,6 +855,14 @@ void DataFlowSanitizer::initializeRuntimeFunctions(Module &M) {
   }
 }
 
+void DataFlowSanitizer::initializeKasperFunctions(Module &M) {
+  DFSanKasperBranchCheckFn = Mod->getOrInsertFunction(
+      "__dfsan_kasper_branch_check", DFSanKasperBranchCheckFnTy);
+  if (Function *F = dyn_cast<Function>(DFSanKasperBranchCheckFn.getCallee())) {
+    F->addParamAttr(0, Attribute::ZExt);
+  }
+}
+
 // Initializes event callback functions and declare them in the module
 void DataFlowSanitizer::initializeCallbackFunctions(Module &M) {
   DFSanLoadCallbackFn = Mod->getOrInsertFunction("__dfsan_load_callback",
@@ -893,6 +917,7 @@ bool DataFlowSanitizer::runOnModule(Module &M) {
   ExternalShadowMask = ClEnableKdfsan ? nullptr :
       Mod->getOrInsertGlobal(kDFSanExternShadowPtrMask, IntptrTy);
 
+  initializeKasperFunctions(M);
   initializeCallbackFunctions(M);
   initializeRuntimeFunctions(M);
 
@@ -911,7 +936,8 @@ bool DataFlowSanitizer::runOnModule(Module &M) {
         &i != DFSanLoadCallbackFn.getCallee()->stripPointerCasts() &&
         &i != DFSanStoreCallbackFn.getCallee()->stripPointerCasts() &&
         &i != DFSanMemTransferCallbackFn.getCallee()->stripPointerCasts() &&
-        &i != DFSanCmpCallbackFn.getCallee()->stripPointerCasts())
+        &i != DFSanCmpCallbackFn.getCallee()->stripPointerCasts() &&
+        &i != DFSanKasperBranchCheckFn.getCallee()->stripPointerCasts())
       FnsToInstrument.push_back(&i);
   }
 
@@ -1725,6 +1751,11 @@ void DFSanVisitor::visitCallBase(CallBase &CB) {
 
   IRBuilder<> IRB(&CB);
 
+  if (CB.isIndirectCall() && ClKasperBranchChecks && !CB.getModule()->getName().contains("mm/kasan/")) {
+    Value *Shadow = DFSF.getShadow(CB.getCalledOperand());
+    IRB.CreateCall(DFSF.DFS.DFSanKasperBranchCheckFn, Shadow);
+  }
+
   DenseMap<Value *, Function *>::iterator i =
       DFSF.DFS.UnwrappedFnMap.find(CB.getCalledOperand());
   if (i != DFSF.DFS.UnwrappedFnMap.end()) {
@@ -1951,4 +1982,28 @@ void DFSanVisitor::visitPHINode(PHINode &PN) {
 
   DFSF.PHIFixups.push_back(std::make_pair(&PN, ShadowPN));
   DFSF.setShadow(&PN, ShadowPN);
+}
+
+void DFSanVisitor::visitBranchInst(BranchInst &I) {
+  if (ClKasperBranchChecks && I.isConditional() && !I.getModule()->getName().contains("mm/kasan/")) {
+    IRBuilder<> IRB(&I);
+    Value *Shadow = DFSF.getShadow(I.getCondition());
+    IRB.CreateCall(DFSF.DFS.DFSanKasperBranchCheckFn, Shadow);
+  }
+}
+
+void DFSanVisitor::visitSwitchInst(SwitchInst &I) {
+  if (ClKasperBranchChecks && !I.getModule()->getName().contains("mm/kasan/")) {
+    IRBuilder<> IRB(&I);
+    Value *Shadow = DFSF.getShadow(I.getCondition());
+    IRB.CreateCall(DFSF.DFS.DFSanKasperBranchCheckFn, Shadow);
+  }
+}
+
+void DFSanVisitor::visitIndirectBrInst(IndirectBrInst &I) {
+  if (ClKasperBranchChecks && !I.getModule()->getName().contains("mm/kasan/")) {
+    IRBuilder<> IRB(&I);
+    Value *Shadow = DFSF.getShadow(I.getAddress());
+    IRB.CreateCall(DFSF.DFS.DFSanKasperBranchCheckFn, Shadow);
+  }
 }
