@@ -180,7 +180,7 @@ static cl::opt<bool> ClDebugNonzeroLabels(
 // following callback functions:
 //   dfsan_label __dfsan_load_callback(void *addr, uptr size,
 //       dfsan_label data_label, dfsan_label ptr_label);
-//   dfsan_label __dfsan_store_callback(void *addr, uptr size,
+//   void __dfsan_store_callback(void *addr, uptr size,
 //       dfsan_label data_label, dfsan_label ptr_label);
 //   void __dfsan_mem_transfer_callback(void *dest, const void *src, uptr size);
 //   void __dfsan_cmp_callback(dfsan_label combined_label);
@@ -371,7 +371,8 @@ class DataFlowSanitizer : public ModulePass {
   FunctionType *DFSanNonzeroLabelFnTy;
   FunctionType *DFSanReadLabelFnTy;
   FunctionType *DFSanVarargWrapperFnTy;
-  FunctionType *DFSanLoadStoreCallbackFnTy;
+  FunctionType *DFSanLoadCallbackFnTy;
+  FunctionType *DFSanStoreCallbackFnTy;
   FunctionType *DFSanMemTransferCallbackFnTy;
   FunctionType *DFSanCmpCallbackFnTy;
   FunctionCallee DFSanUnionFn;
@@ -635,10 +636,14 @@ bool DataFlowSanitizer::doInitialization(Module &M) {
   Type *DFSanReadLabelArgs[2] = { Type::getInt8PtrTy(*Ctx), IntptrTy };
   DFSanReadLabelFnTy =
       FunctionType::get(ShadowTy, DFSanReadLabelArgs, /*isVarArg=*/ false);
-  Type *DFSanLoadStoreCallbackArgs[4] =
+  Type *DFSanLoadCallbackArgs[4] =
       { Type::getInt8PtrTy(*Ctx), IntptrTy, ShadowTy, ShadowTy };
-  DFSanLoadStoreCallbackFnTy = FunctionType::get(ShadowTy,
-      DFSanLoadStoreCallbackArgs, /*isVarArg=*/ false);
+  DFSanLoadCallbackFnTy = FunctionType::get(ShadowTy,
+      DFSanLoadCallbackArgs, /*isVarArg=*/ false);
+  Type *DFSanStoreCallbackArgs[4] =
+      { Type::getInt8PtrTy(*Ctx), IntptrTy, ShadowTy, ShadowTy };
+  DFSanStoreCallbackFnTy = FunctionType::get(Type::getVoidTy(*Ctx),
+      DFSanStoreCallbackArgs, /*isVarArg=*/ false);
   Type *DFSanMemTransferArgs[3] =
       { Type::getInt8PtrTy(*Ctx), Type::getInt8PtrTy(*Ctx), IntptrTy };
   DFSanMemTransferCallbackFnTy = FunctionType::get(Type::getVoidTy(*Ctx),
@@ -842,16 +847,15 @@ void DataFlowSanitizer::initializeRuntimeFunctions(Module &M) {
 // Initializes event callback functions and declare them in the module
 void DataFlowSanitizer::initializeCallbackFunctions(Module &M) {
   DFSanLoadCallbackFn = Mod->getOrInsertFunction("__dfsan_load_callback",
-      DFSanLoadStoreCallbackFnTy);
+      DFSanLoadCallbackFnTy);
   if (Function *F = dyn_cast<Function>(DFSanLoadCallbackFn.getCallee())) {
     F->addAttribute(AttributeList::ReturnIndex, Attribute::ZExt);
     F->addParamAttr(2, Attribute::ZExt);
     F->addParamAttr(3, Attribute::ZExt);
   }
   DFSanStoreCallbackFn = Mod->getOrInsertFunction("__dfsan_store_callback",
-      DFSanLoadStoreCallbackFnTy);
+      DFSanStoreCallbackFnTy);
   if (Function *F = dyn_cast<Function>(DFSanStoreCallbackFn.getCallee())) {
-    F->addAttribute(AttributeList::ReturnIndex, Attribute::ZExt);
     F->addParamAttr(2, Attribute::ZExt);
     F->addParamAttr(3, Attribute::ZExt);
   }
@@ -1444,13 +1448,11 @@ void DFSanVisitor::visitLoadInst(LoadInst &LI) {
   Value *Shadow =
       DFSF.loadShadow(LI.getPointerOperand(), Size, Alignment.value(), &LI);
 
-  bool InsertLoadCallback =
-      DFSF.DFS.InsertCallbacks && LI.getMetadata("is-asan-instr");
   Value *PtrShadow;
-  if(ClCombinePointerLabelsOnLoad  || InsertLoadCallback)
+  if(ClCombinePointerLabelsOnLoad  || DFSF.DFS.InsertCallbacks)
     PtrShadow = DFSF.getShadow(LI.getPointerOperand());
 
-  if (InsertLoadCallback) {
+  if (DFSF.DFS.InsertCallbacks) {
     IRBuilder<> IRB(&LI);
     Shadow = IRB.CreateCall(DFSF.DFS.DFSanLoadCallbackFn,
         {IRB.CreateBitCast(LI.getPointerOperand(),
@@ -1537,15 +1539,13 @@ void DFSanVisitor::visitStoreInst(StoreInst &SI) {
 
   Value* Shadow = DFSF.getShadow(SI.getValueOperand());
 
-  bool InsertStoreCallback =
-      DFSF.DFS.InsertCallbacks && SI.getMetadata("is-asan-instr");
   Value *PtrShadow;
-  if(ClCombinePointerLabelsOnStore  || InsertStoreCallback)
+  if(ClCombinePointerLabelsOnStore  || DFSF.DFS.InsertCallbacks)
     PtrShadow = DFSF.getShadow(SI.getPointerOperand());
 
-  if (InsertStoreCallback) {
+  if (DFSF.DFS.InsertCallbacks) {
     IRBuilder<> IRB(&SI);
-    Shadow = IRB.CreateCall(DFSF.DFS.DFSanStoreCallbackFn,
+    IRB.CreateCall(DFSF.DFS.DFSanStoreCallbackFn,
     {IRB.CreateBitCast(SI.getPointerOperand(),
     Type::getInt8PtrTy(*DFSF.DFS.Ctx)),
     ConstantInt::get(DFSF.DFS.IntptrTy, Size), Shadow, PtrShadow});
