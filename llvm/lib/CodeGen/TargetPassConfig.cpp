@@ -1042,6 +1042,9 @@ void TargetPassConfig::addMachinePasses() {
   // Add passes that directly emit MI after all other MI passes.
   addPreEmitPass2();
 
+  // enable this to count x86 instructions
+  // addPass(&CountInstrsID, false);
+
   AddingMachinePasses = false;
 }
 

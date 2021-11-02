@@ -16,6 +16,7 @@ add_llvm_component_library(LLVMCodeGen
   CodeGen.cpp
   CodeGenPrepare.cpp
   CommandFlags.cpp
+  CountInstrs.cpp
   CriticalAntiDepBreaker.cpp
   DeadMachineInstructionElim.cpp
   DetectDeadLanes.cpp

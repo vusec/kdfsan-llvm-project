@@ -161,6 +161,8 @@ namespace llvm {
   /// This pass adds dead/undef flags after analyzing subregister lanes.
   extern char &DetectDeadLanesID;
 
+  extern char &CountInstrsID;
+
   /// This pass perform post-ra machine sink for COPY instructions.
   extern char &PostRAMachineSinkingID;
 
