@@ -91,6 +91,11 @@
 #include "llvm/Transforms/Instrumentation.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/Local.h"
+#define KDFSAN_KEEP_UNINSTRUMENTED_FUNCS
+#ifdef KDFSAN_KEEP_UNINSTRUMENTED_FUNCS
+#include "llvm/Transforms/Utils/ValueMapper.h"
+#include "llvm/Transforms/Utils/Cloning.h"
+#endif
 #include <algorithm>
 #include <cassert>
 #include <cstddef>
@@ -954,11 +959,31 @@ bool DataFlowSanitizer::runOnModule(Module &M) {
        i != e; ++i) {
     Function &F = **i;
     FunctionType *FT = F.getFunctionType();
+#ifdef KDFSAN_KEEP_UNINSTRUMENTED_FUNCS
+    bool finishClone = false;
+    std::string old_name(F.getName());
+#endif
 
     bool IsZeroArgsVoidRet = (FT->getNumParams() == 0 && !FT->isVarArg() &&
                               FT->getReturnType()->isVoidTy());
 
     if (isInstrumented(&F)) {
+#ifdef KDFSAN_KEEP_UNINSTRUMENTED_FUNCS
+      Function *NoInstrumentFn;
+      // First make a clone of the uninstrumented function if it's not a declaration.
+      if (!F.isDeclaration()) {
+          // Only if it's not local to the translation unit.
+          if (!(F.getLinkage() == GlobalValue::InternalLinkage || F.getLinkage() == GlobalValue::PrivateLinkage)){
+               ValueToValueMapTy VMap;
+               NoInstrumentFn = CloneFunction(&F, VMap);
+               // Same linkage and visibility as previous func (think this is unnecessary but wtv).
+               NoInstrumentFn->setLinkage(F.getLinkage());
+               NoInstrumentFn->setVisibility(F.getVisibility());
+               finishClone = true;
+           }
+      }
+#endif
+
       // Instrumented functions get a 'dfs$' prefix.  This allows us to more
       // easily identify cases of mismatching ABIs.
       if (getInstrumentedABI() == IA_Args && !IsZeroArgsVoidRet) {
@@ -996,6 +1021,11 @@ bool DataFlowSanitizer::runOnModule(Module &M) {
       } else {
         addGlobalNamePrefix(&F);
       }
+#ifdef KDFSAN_KEEP_UNINSTRUMENTED_FUNCS
+      if (finishClone){
+          NoInstrumentFn->setName(old_name);
+      }
+#endif
     } else if (!IsZeroArgsVoidRet || getWrapperKind(&F) == WK_Custom) {
       // Build a wrapper function for F.  The wrapper simply calls F, and is
       // added to FnsToInstrument so that any instrumentation according to its
