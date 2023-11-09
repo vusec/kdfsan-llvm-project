@@ -130,6 +130,15 @@ static cl::opt<bool> ClKeepUninstDefs(
     cl::desc("Keep a copy of the uninstrumented function definitions."),
     cl::Hidden, cl::init(false));
 
+
+// The -dfsan-task-centric-local-storage, probes KDFSAN to use a per-task
+// shadow structure for arguments and return. Structure must be supplied by
+// the kernel runtime.
+static cl::opt<bool> ClTaskCentricLocalStorage(
+    "dfsan-task-centric-local-storage",
+    cl::desc("Keep a copy of the uninstrumented function definitions."),
+    cl::Hidden, cl::init(false));
+
 // The -dfsan-preserve-alignment flag controls whether this pass assumes that
 // alignment requirements provided by the input IR are correct.  For example,
 // if the input IR contains a load with alignment 8, this flag will cause
@@ -398,6 +407,12 @@ class DataFlowSanitizer : public ModulePass {
   FunctionCallee DFSanMemTransferCallbackFn;
   FunctionCallee DFSanCmpCallbackFn;
   MDNode *ColdCallWeights;
+
+  /// KDFSAN callback and shadow struct type for arg/ret shadow.
+  StructType *DFSanContextStateTy;
+  FunctionCallee DFSanGetContextStateFn;
+
+
   DFSanABIList ABIList;
   DenseMap<Value *, Function *> UnwrappedFnMap;
   AttrBuilder ReadOnlyNoneAttrs;
@@ -439,6 +454,7 @@ struct DFSanFunction {
   bool IsNativeABI;
   Value *ArgTLSPtr = nullptr;
   Value *RetvalTLSPtr = nullptr;
+  Value *DFSanTLSContext = nullptr;
   AllocaInst *LabelReturnAlloca = nullptr;
   DenseMap<Value *, Value *> ValShadowMap;
   DenseMap<AllocaInst *, AllocaInst *> AllocaShadowMap;
@@ -446,6 +462,7 @@ struct DFSanFunction {
   DenseSet<Instruction *> SkipInsts;
   std::vector<Value *> NonZeroChecks;
   bool AvoidNewBlocks;
+  Instruction *FnPrologueEnd = nullptr;
 
   struct CachedCombinedShadow {
     BasicBlock *Block;
@@ -456,7 +473,7 @@ struct DFSanFunction {
   DenseMap<Value *, std::set<Value *>> ShadowElements;
 
   DFSanFunction(DataFlowSanitizer &DFS, Function *F, bool IsNativeABI)
-      : DFS(DFS), F(F), IA(DFS.getInstrumentedABI()), IsNativeABI(IsNativeABI) {
+      : DFS(DFS), F(F), IA(DFS.getInstrumentedABI()), IsNativeABI(IsNativeABI), DFSanTLSContext(nullptr) {
     DT.recalculate(*F);
     // FIXME: Need to track down the register allocator issue which causes poor
     // performance in pathological cases with large numbers of basic blocks.
@@ -661,6 +678,7 @@ bool DataFlowSanitizer::doInitialization(Module &M) {
   DFSanCmpCallbackFnTy =
       FunctionType::get(Type::getVoidTy(*Ctx), ShadowTy, /*isVarArg=*/false);
 
+
   if (GetArgTLSPtr) {
     Type *ArgTLSTy = ArrayType::get(ShadowTy, 64);
     ArgTLS = nullptr;
@@ -675,6 +693,21 @@ bool DataFlowSanitizer::doInitialization(Module &M) {
     GetRetvalTLS = ConstantExpr::getIntToPtr(
         ConstantInt::get(IntptrTy, uintptr_t(GetRetvalTLSPtr)),
         PointerType::getUnqual(GetRetvalTLSTy));
+  }
+
+  if (ClTaskCentricLocalStorage){
+      //  Get Shadow structure type for task tls.
+      //  We asume the kernel provide a shadow structure of the form
+      //  struct kdfsan_context_state {
+      //         dfsan_label __dfsan_retval_tls;
+      //         dfsan_label __dfsan_arg_tls[KDFSAN_PARAM_SIZE];
+      //  }
+      //  Must be both as parameter in current but also a per-cpu struct to use
+      //  in interrupt context.
+      DFSanContextStateTy = StructType::get(ShadowTy, /* return address  shadow*/
+                                           ArrayType::get(ShadowTy, 64) /* parameter shadow */);
+      RetvalTLS = nullptr;
+      ArgTLS = nullptr;
   }
 
   ColdCallWeights = MDBuilder(*Ctx).createBranchWeights(1, 1000);
@@ -873,6 +906,9 @@ void DataFlowSanitizer::initializeCallbackFunctions(Module &M) {
       "__dfsan_mem_transfer_callback", DFSanMemTransferCallbackFnTy);
   DFSanCmpCallbackFn =
       Mod->getOrInsertFunction("__dfsan_cmp_callback", DFSanCmpCallbackFnTy);
+
+  if (ClTaskCentricLocalStorage)
+      DFSanGetContextStateFn = Mod->getOrInsertFunction("__dfsan_get_context_state", PointerType::get(DFSanContextStateTy, 0));
 }
 
 bool DataFlowSanitizer::runOnModule(Module &M) {
@@ -884,7 +920,7 @@ bool DataFlowSanitizer::runOnModule(Module &M) {
 
   bool Changed = false;
 
-  if (!GetArgTLSPtr) {
+  if (!GetArgTLSPtr && !ClTaskCentricLocalStorage) {
     Type *ArgTLSTy = ArrayType::get(ShadowTy, 64);
     ArgTLS = Mod->getOrInsertGlobal("__dfsan_arg_tls", ArgTLSTy);
     // TODO: For KDFSAN, call runtime lib to get ptr to TLS (like KMSAN)
@@ -894,7 +930,7 @@ bool DataFlowSanitizer::runOnModule(Module &M) {
       G->setThreadLocalMode(GlobalVariable::InitialExecTLSModel);
     }
   }
-  if (!GetRetvalTLSPtr) {
+  if (!GetRetvalTLSPtr && !ClTaskCentricLocalStorage) {
     RetvalTLS = Mod->getOrInsertGlobal("__dfsan_retval_tls", ShadowTy);
     // TODO: For KDFSAN, call runtime lib to get ptr to TLS (like KMSAN)
     GlobalVariable *G = dyn_cast<GlobalVariable>(RetvalTLS);
@@ -925,8 +961,15 @@ bool DataFlowSanitizer::runOnModule(Module &M) {
         &i != DFSanLoadCallbackFn.getCallee()->stripPointerCasts() &&
         &i != DFSanStoreCallbackFn.getCallee()->stripPointerCasts() &&
         &i != DFSanMemTransferCallbackFn.getCallee()->stripPointerCasts() &&
-        &i != DFSanCmpCallbackFn.getCallee()->stripPointerCasts())
-      FnsToInstrument.push_back(&i);
+        &i != DFSanCmpCallbackFn.getCallee()->stripPointerCasts()){
+         if (ClTaskCentricLocalStorage) {
+            if (&i != DFSanGetContextStateFn.getCallee()->stripPointerCasts())
+               FnsToInstrument.push_back(&i);
+         }
+         else {
+               FnsToInstrument.push_back(&i);
+         }
+       }
   }
 
   // Give function aliases prefixes when necessary, and build wrappers where the
@@ -1146,6 +1189,7 @@ bool DataFlowSanitizer::runOnModule(Module &M) {
         ThenIRB.CreateCall(DFSF.DFS.DFSanNonzeroLabelFn, {});
       }
     }
+
   }
 
   return Changed || !FnsToInstrument.empty() ||
@@ -1155,20 +1199,66 @@ bool DataFlowSanitizer::runOnModule(Module &M) {
 Value *DFSanFunction::getArgTLSPtr() {
   if (ArgTLSPtr)
     return ArgTLSPtr;
+
   if (DFS.ArgTLS)
     return ArgTLSPtr = DFS.ArgTLS;
 
-  IRBuilder<> IRB(&F->getEntryBlock().front());
+
+  if (ClTaskCentricLocalStorage){
+     /* Get Reference to the first instrumentable instruction in the block */
+     if (!FnPrologueEnd){
+          FnPrologueEnd = IRBuilder<>(F->getEntryBlock().getFirstNonPHI())
+                        .CreateIntrinsic(Intrinsic::donothing, {}, {});
+     }
+     IRBuilder<> IRB(FnPrologueEnd);
+
+     /* If we previously created a task context use it to fetch the argument shadow */
+     if (!DFSanTLSContext){
+        /* Else first call into the runtime to retrieve the context */
+        DFSanTLSContext = IRB.CreateCall(DFS.DFSanGetContextStateFn, {});
+     }
+    
+     /* Now return shadow for the params. */
+     Constant *Zero = IRB.getInt32(0);
+     return ArgTLSPtr = IRB.CreateGEP(DFS.DFSanContextStateTy, DFSanTLSContext,
+                                {Zero, IRB.getInt32(1)}, "");
+     //return ArgTLSPtr = IRB.CreateConstGEP2_64(DFS.DFSanContextStateTy, DFSanTLSContext, 0, 1);
+  }
+
+  IRBuilder<> IRB(&F->getEntryBlock().front()); 
   return ArgTLSPtr = IRB.CreateCall(DFS.GetArgTLSTy, DFS.GetArgTLS, {});
 }
 
 Value *DFSanFunction::getRetvalTLS() {
   if (RetvalTLSPtr)
     return RetvalTLSPtr;
+
   if (DFS.RetvalTLS)
     return RetvalTLSPtr = DFS.RetvalTLS;
 
+  if (ClTaskCentricLocalStorage){
+     /* Get Reference to the first instrumentable instruction in the func */
+     if (!FnPrologueEnd){
+           FnPrologueEnd = IRBuilder<>(F->getEntryBlock().getFirstNonPHI())
+                         .CreateIntrinsic(Intrinsic::donothing, {}, {});
+     }
+
+     IRBuilder<> IRB(FnPrologueEnd);
+
+     if (!DFSanTLSContext){
+        /* Else first call into the runtime to retrieve the context */
+        DFSanTLSContext = IRB.CreateCall(DFS.DFSanGetContextStateFn, {});
+     }
+       
+     /* Now return shadow for return value */
+     Constant *Zero = IRB.getInt32(0);
+     return RetvalTLSPtr = IRB.CreateGEP(DFS.DFSanContextStateTy, DFSanTLSContext,
+                                {Zero, IRB.getInt32(0)}, "");
+     //return RetvalTLSPtr = IRB.CreateConstGEP2_64(DFS.DFSanContextStateTy, DFSanTLSContext, 0, 0);
+  }
+
   IRBuilder<> IRB(&F->getEntryBlock().front());
+
   return RetvalTLSPtr =
              IRB.CreateCall(DFS.GetRetvalTLSTy, DFS.GetRetvalTLS, {});
 }
