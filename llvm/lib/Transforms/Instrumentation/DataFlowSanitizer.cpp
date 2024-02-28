@@ -208,6 +208,14 @@ static cl::opt<bool> ClEventCallbacks(
     cl::desc("Insert calls to __dfsan_*_callback functions on data events."),
     cl::Hidden, cl::init(false));
 
+// Experimental feature that inserts callbacks for conditionals, including:
+// conditional branch, switch, select.
+// This must be true for dfsan_set_conditional_callback() to have effect.
+static cl::opt<bool> ClConditionalCallbacks(
+    "dfsan-conditional-callbacks",
+    cl::desc("Insert calls to callback functions on conditionals."), cl::Hidden,
+    cl::init(false));
+
 static StringRef GetGlobalTypeString(const GlobalValue &G) {
   // Types of GlobalVariables are always pointer types.
   Type *GType = G.getValueType();
@@ -390,6 +398,7 @@ class DataFlowSanitizer : public ModulePass {
   FunctionType *DFSanNonzeroLabelFnTy;
   FunctionType *DFSanReadLabelFnTy;
   FunctionType *DFSanVarargWrapperFnTy;
+  FunctionType *DFSanConditionalCallbackFnTy;
   FunctionType *DFSanLoadCallbackFnTy;
   FunctionType *DFSanStoreCallbackFnTy;
   FunctionType *DFSanMemTransferCallbackFnTy;
@@ -405,6 +414,7 @@ class DataFlowSanitizer : public ModulePass {
   FunctionCallee DFSanLoadCallbackFn;
   FunctionCallee DFSanStoreCallbackFn;
   FunctionCallee DFSanMemTransferCallbackFn;
+  FunctionCallee DFSanConditionalCallbackFn;
   FunctionCallee DFSanCmpCallbackFn;
   MDNode *ColdCallWeights;
 
@@ -491,6 +501,9 @@ struct DFSanFunction {
                     Instruction *Pos);
   void storeShadow(Value *Addr, uint64_t Size, Align Alignment, Value *Shadow,
                    Instruction *Pos);
+  // If ClConditionalCallbacks is enabled, insert a callback after a given
+  // branch instruction using the given conditional expression.
+  void addConditionalCallbacksIfEnabled(Instruction &I, Value *Condition);
 };
 
 class DFSanVisitor : public InstVisitor<DFSanVisitor> {
@@ -526,6 +539,8 @@ public:
   void visitSelectInst(SelectInst &I);
   void visitMemSetInst(MemSetInst &I);
   void visitMemTransferInst(MemTransferInst &I);
+  void visitBranchInst(BranchInst &BR);
+  void visitSwitchInst(SwitchInst &SW);
 };
 
 } // end anonymous namespace
@@ -611,6 +626,16 @@ TransformedFunction DataFlowSanitizer::getCustomFunctionType(FunctionType *T) {
       ArgumentIndexMapping);
 }
 
+void DFSanFunction::addConditionalCallbacksIfEnabled(Instruction &I,
+                                                     Value *Condition) {
+  if (!ClConditionalCallbacks) {
+    return;
+  }
+  IRBuilder<> IRB(&I);
+  Value *CondShadow = getShadow(Condition);
+  IRB.CreateCall(DFS.DFSanConditionalCallbackFn, {CondShadow});
+}
+
 bool DataFlowSanitizer::doInitialization(Module &M) {
   Triple TargetTriple(M.getTargetTriple());
   bool IsX86_64 = TargetTriple.getArch() == Triple::x86_64;
@@ -677,6 +702,9 @@ bool DataFlowSanitizer::doInitialization(Module &M) {
       DFSanMemTransferArgs, /*isVarArg=*/false);
   DFSanCmpCallbackFnTy =
       FunctionType::get(Type::getVoidTy(*Ctx), ShadowTy, /*isVarArg=*/false);
+  DFSanConditionalCallbackFnTy =
+      FunctionType::get(Type::getVoidTy(*Ctx), ShadowTy,
+                        /*isVarArg=*/false);
 
 
   if (GetArgTLSPtr) {
@@ -906,6 +934,8 @@ void DataFlowSanitizer::initializeCallbackFunctions(Module &M) {
       "__dfsan_mem_transfer_callback", DFSanMemTransferCallbackFnTy);
   DFSanCmpCallbackFn =
       Mod->getOrInsertFunction("__dfsan_cmp_callback", DFSanCmpCallbackFnTy);
+  DFSanConditionalCallbackFn = Mod->getOrInsertFunction(
+      "__dfsan_conditional_callback", DFSanConditionalCallbackFnTy);
 
   if (ClTaskCentricLocalStorage)
       DFSanGetContextStateFn = Mod->getOrInsertFunction("__dfsan_get_context_state", PointerType::get(DFSanContextStateTy, 0));
@@ -961,7 +991,8 @@ bool DataFlowSanitizer::runOnModule(Module &M) {
         &i != DFSanLoadCallbackFn.getCallee()->stripPointerCasts() &&
         &i != DFSanStoreCallbackFn.getCallee()->stripPointerCasts() &&
         &i != DFSanMemTransferCallbackFn.getCallee()->stripPointerCasts() &&
-        &i != DFSanCmpCallbackFn.getCallee()->stripPointerCasts()){
+        &i != DFSanCmpCallbackFn.getCallee()->stripPointerCasts() &&
+        &i != DFSanConditionalCallbackFn.getCallee()->stripPointerCasts()){
          if (ClTaskCentricLocalStorage) {
             if (&i != DFSanGetContextStateFn.getCallee()->stripPointerCasts())
                FnsToInstrument.push_back(&i);
@@ -1747,6 +1778,8 @@ void DFSanVisitor::visitSelectInst(SelectInst &I) {
   Value *TrueShadow = DFSF.getShadow(I.getTrueValue());
   Value *FalseShadow = DFSF.getShadow(I.getFalseValue());
 
+  DFSF.addConditionalCallbacksIfEnabled(I, I.getCondition());
+
   if (isa<VectorType>(I.getCondition()->getType())) {
     DFSF.setShadow(
         &I,
@@ -1804,6 +1837,17 @@ void DFSanVisitor::visitMemTransferInst(MemTransferInst &I) {
       MTI->setSourceAlignment(Align(DFSF.DFS.ShadowWidthBytes));
     }
   }
+}
+
+void DFSanVisitor::visitBranchInst(BranchInst &BR) {
+  if (!BR.isConditional())
+    return;
+
+  DFSF.addConditionalCallbacksIfEnabled(BR, BR.getCondition());
+}
+
+void DFSanVisitor::visitSwitchInst(SwitchInst &SW) {
+  DFSF.addConditionalCallbacksIfEnabled(SW, SW.getCondition());
 }
 
 void DFSanVisitor::visitReturnInst(ReturnInst &RI) {
