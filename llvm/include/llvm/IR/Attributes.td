@@ -200,6 +200,9 @@ def SanitizeThread : EnumAttr<"sanitize_thread">;
 /// MemorySanitizer is on.
 def SanitizeMemory : EnumAttr<"sanitize_memory">;
 
+/// DataFlowSanitizer is on.
+def SanitizeDataFlow : EnumAttr<"sanitize_dataflow">;
+
 /// HWAddressSanitizer is on.
 def SanitizeHWAddress : EnumAttr<"sanitize_hwaddress">;
 
