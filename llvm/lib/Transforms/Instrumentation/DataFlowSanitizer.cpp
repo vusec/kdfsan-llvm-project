@@ -198,31 +198,16 @@ static cl::opt<bool> ClDebugNonzeroLabels(
 //
 // If this flag is set to true, the user must provide definitions for the
 // following callback functions:
-//   void __dfsan_store_callback(u64 data, void *addr, uptr size,
-//       dfsan_label data_label, dfsan_label ptr_label);
-static cl::opt<bool> ClStoreEventCallbacks(
-    "dfsan-event-callbacks-store",
-    cl::desc("Insert calls to __dfsan_store_callback functions on data events."),
-    cl::Hidden, cl::init(false));
-
 //   dfsan_label __dfsan_load_callback(void *addr, uptr size,
 //       dfsan_label data_label, dfsan_label ptr_label);
-static cl::opt<bool> ClLoadEventCallbacks(
-    "dfsan-event-callbacks-load",
-    cl::desc("Insert calls to __dfsan_load_callback functions on data events."),
-    cl::Hidden, cl::init(false));
-
+//   void __dfsan_store_callback(u64 data, void *addr, uptr size,
+//       dfsan_label data_label, dfsan_label ptr_label);
 //   void __dfsan_mem_transfer_callback(void *dest, const void *src, uptr size,
 //       dfsan_label dest_label, dfsan_label src_label, dfsan_label size_label);
-static cl::opt<bool> ClMemTransferEventCallbacks(
-    "dfsan-event-callbacks-mem-transfer",
-    cl::desc("Insert calls to __dfsan_mem_transfer_callback functions on data events."),
-    cl::Hidden, cl::init(false));
-
 //   void __dfsan_cmp_callback(dfsan_label combined_label);
-static cl::opt<bool> ClCmpEventCallbacks(
-    "dfsan-event-callbacks-cmp",
-    cl::desc("Insert calls to __dfsan_cmp_callback functions on data events."),
+static cl::opt<bool> ClEventCallbacks(
+    "dfsan-event-callbacks",
+    cl::desc("Insert calls to __dfsan_*_callback functions on data events."),
     cl::Hidden, cl::init(false));
 
 // Experimental feature that inserts callbacks for conditionals, including:
@@ -1693,10 +1678,10 @@ void DFSanVisitor::visitLoadInst(LoadInst &LI) {
       DFSF.loadShadow(LI.getPointerOperand(), Size, Alignment.value(), &LI);
 
   Value *PtrShadow;
-  if(ClCombinePointerLabelsOnLoad || ClLoadEventCallbacks)
+  if(ClCombinePointerLabelsOnLoad || ClEventCallbacks)
     PtrShadow = DFSF.getShadow(LI.getPointerOperand());
 
-  if (ClLoadEventCallbacks && !DFSF.ClearTaint) {
+  if (ClEventCallbacks && !DFSF.ClearTaint) {
     IRBuilder<> IRB(&LI);
     Shadow = IRB.CreateCall(DFSF.DFS.DFSanLoadCallbackFn,
         {IRB.CreateBitCast(LI.getPointerOperand(),
@@ -1786,10 +1771,10 @@ void DFSanVisitor::visitStoreInst(StoreInst &SI) {
   Value* Shadow = DFSF.getShadow(StoredVal);
 
   Value *PtrShadow;
-  if(ClCombinePointerLabelsOnStore  || ClStoreEventCallbacks)
+  if(ClCombinePointerLabelsOnStore  || ClEventCallbacks)
     PtrShadow = DFSF.getShadow(SI.getPointerOperand());
 
-  if (ClStoreEventCallbacks && !DFSF.ClearTaint) {
+  if (ClEventCallbacks && !DFSF.ClearTaint) {
     IRBuilder<> IRB(&SI);
 
     Value *ValArg;
@@ -1827,7 +1812,7 @@ void DFSanVisitor::visitCastInst(CastInst &CI) { visitOperandShadowInst(CI); }
 
 void DFSanVisitor::visitCmpInst(CmpInst &CI) {
   Value *CombinedShadow = visitOperandShadowInst(CI);
-  if (ClCmpEventCallbacks && !DFSF.ClearTaint) {
+  if (ClEventCallbacks && !DFSF.ClearTaint) {
     IRBuilder<> IRB(&CI);
     IRB.CreateCall(DFSF.DFS.DFSanCmpCallbackFn, CombinedShadow);
   }
@@ -1923,7 +1908,7 @@ void DFSanVisitor::visitMemTransferInst(MemTransferInst &I) {
     return;
   }
 
-  if (ClMemTransferEventCallbacks || ClEnableKdfsan) {
+  if (ClEventCallbacks || ClEnableKdfsan) {
     Value *Dest = IRB.CreateBitCast(I.getDest(), Int8Ptr);
     Value *Src = IRB.CreateBitCast(I.getSource(), Int8Ptr);
     Value *Size = IRB.CreateZExtOrTrunc(I.getLength(), DFSF.DFS.IntptrTy);
