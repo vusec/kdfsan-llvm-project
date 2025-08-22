@@ -319,6 +319,11 @@ static cl::opt<bool> ClWithComdat("msan-with-comdat",
        cl::desc("Place MSan constructors in comdat sections"),
        cl::Hidden, cl::init(false));
 
+static cl::opt<bool>
+    ClDisableChecks("msan-disable-checks",
+                    cl::desc("Apply no_sanitize to the whole file"), cl::Hidden,
+                    cl::init(false));
+
 // These options allow to specify custom memory map parameters
 // See MemoryMapParams for details.
 static cl::opt<uint64_t> ClAndMask("msan-and-mask",
@@ -1075,7 +1080,7 @@ struct MemorySanitizerVisitor : public InstVisitor<MemorySanitizerVisitor> {
   MemorySanitizerVisitor(Function &F, MemorySanitizer &MS,
                          const TargetLibraryInfo &TLI)
       : F(F), MS(MS), VAHelper(CreateVarArgHelper(F, MS, *this)), TLI(&TLI) {
-    bool SanitizeFunction = F.hasFnAttribute(Attribute::SanitizeMemory);
+    bool SanitizeFunction = F.hasFnAttribute(Attribute::SanitizeMemory) && !ClDisableChecks;
     InsertChecks = SanitizeFunction;
     PropagateShadow = SanitizeFunction;
     PoisonStack = SanitizeFunction && ClPoisonStack;
