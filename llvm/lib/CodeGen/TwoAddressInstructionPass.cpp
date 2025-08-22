@@ -1386,7 +1386,7 @@ TwoAddressInstructionPass::processTiedPairs(MachineInstr *MI,
     assert(Register::isVirtualRegister(RegB) &&
            "cannot make instruction into two-address form");
 
-#ifndef NDEBUG
+#if 0
     // First, verify that we don't have a use of "a" in the instruction
     // (a = b + a for example) because our transformation will not
     // work. This should never occur because we are in SSA form.
